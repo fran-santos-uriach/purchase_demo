@@ -1,0 +1,631 @@
+import { useState, useCallback, useMemo, useRef } from "react";
+import * as XLSX from "xlsx";
+
+// ─── CONSTANTES ────────────────────────────────────────────────────────────
+const CLASS_DEFAULTS = {
+  A: { min: 20, buy: 60 },
+  B: { min: 15, buy: 50 },
+  C: { min: 10, buy: 40 },
+};
+
+const STATUS_ORDER = { ROJO: 0, AMARILLO: 1, MUERTO: 2, VERDE: 3 };
+
+const DEFAULT_CONFIG = {
+  windowN: 30,
+  horizonH: 30,
+  safetyExtraDays: 7,
+  roundingMultiple: 1,
+  thresholds: {
+    A: { min: 20, buy: 60 },
+    B: { min: 15, buy: 50 },
+    C: { min: 10, buy: 40 },
+  },
+};
+
+// ─── UTILIDADES DE PARSING ─────────────────────────────────────────────────
+function parseExcelDate(val) {
+  if (val == null || val === "") return null;
+  if (typeof val === "number") {
+    const d = XLSX.SSF.parse_date_code(val);
+    if (!d) return null;
+    return new Date(d.y, d.m - 1, d.d);
+  }
+  if (val instanceof Date) return isNaN(val) ? null : val;
+  if (typeof val === "string") {
+    const s = val.trim().replace(/\//g, "-");
+    const d = new Date(s);
+    return isNaN(d) ? null : d;
+  }
+  return null;
+}
+
+function normalizeClass(val) {
+  if (!val) return "B";
+  const v = String(val).trim().toUpperCase();
+  return ["A", "B", "C"].includes(v) ? v : "B";
+}
+
+function parseWorkbook(buffer) {
+  const wb = XLSX.read(buffer, { type: "array", cellDates: false });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const raw = XLSX.utils.sheet_to_json(ws, { defval: null });
+
+  if (!raw.length) throw new Error("La hoja está vacía.");
+
+  const firstRow = raw[0];
+  const keys = Object.keys(firstRow).map(k => k.trim().toLowerCase());
+  const required = ["sku", "date", "stock", "pvp"];
+  const missing = required.filter(r => !keys.includes(r));
+  if (missing.length) throw new Error(`Columnas obligatorias faltantes: ${missing.join(", ")}`);
+
+  const normalize = (row) => {
+    const get = (k) => {
+      const found = Object.keys(row).find(rk => rk.trim().toLowerCase() === k);
+      return found !== undefined ? row[found] : undefined;
+    };
+    return {
+      sku: get("sku"),
+      date: get("date"),
+      stock: get("stock"),
+      pvp: get("pvp"),
+      categoria: get("categoria"),
+    };
+  };
+
+  const warnings = [];
+  const valid = [];
+
+  raw.forEach((rawRow, i) => {
+    const row = normalize(rawRow);
+    const rowNum = i + 2;
+
+    if (!row.sku || String(row.sku).trim() === "") {
+      warnings.push(`Fila ${rowNum}: SKU vacío, omitida.`);
+      return;
+    }
+    const date = parseExcelDate(row.date);
+    if (!date) {
+      warnings.push(`Fila ${rowNum}: Fecha inválida "${row.date}", omitida.`);
+      return;
+    }
+    const stock = parseFloat(row.stock);
+    if (isNaN(stock) || stock < 0) {
+      warnings.push(`Fila ${rowNum}: Stock inválido "${row.stock}", omitida.`);
+      return;
+    }
+    let pvp = null;
+    if (row.pvp !== null && row.pvp !== undefined && row.pvp !== "") {
+      pvp = parseFloat(row.pvp);
+      if (isNaN(pvp) || pvp < 0) {
+        warnings.push(`Fila ${rowNum}: PVP inválido "${row.pvp}", se usará null.`);
+        pvp = null;
+      }
+    }
+    valid.push({
+      sku: String(row.sku).trim(),
+      date,
+      stock,
+      pvp,
+      categoria: normalizeClass(row.categoria),
+    });
+  });
+
+  if (!valid.length) throw new Error("No quedan filas válidas tras la limpieza.");
+  return { data: valid, warnings };
+}
+
+// ─── LÓGICA DE NEGOCIO ─────────────────────────────────────────────────────
+function sanitizeConfig(config) {
+  const cfg = { ...config, thresholds: { ...config.thresholds } };
+  ["A", "B", "C"].forEach(c => {
+    let { min, buy } = cfg.thresholds[c];
+    if (buy <= min) buy = min + 1;
+    cfg.thresholds[c] = { min, buy };
+  });
+  return cfg;
+}
+
+function calculateSkuRecommendations(data, config, classBySku = {}) {
+  const cfg = sanitizeConfig(config);
+  const { windowN, horizonH, safetyExtraDays, roundingMultiple, thresholds } = cfg;
+
+  // Agrupar por SKU
+  const bySkuMap = {};
+  data.forEach(row => {
+    if (!bySkuMap[row.sku]) bySkuMap[row.sku] = {};
+    const dk = row.date.toISOString().slice(0, 10);
+    bySkuMap[row.sku][dk] = row;
+  });
+
+  const results = [];
+
+  Object.entries(bySkuMap).forEach(([sku, dateMap]) => {
+    const rows = Object.values(dateMap).sort((a, b) => a.date - b.date);
+    const clase = classBySku[sku] || rows[rows.length - 1].categoria || "B";
+    const { min: minPct, buy: buyPct } = thresholds[clase];
+
+    // Intervalos diarios
+    const intervals = [];
+    for (let i = 1; i < rows.length; i++) {
+      const prev = rows[i - 1].stock;
+      const curr = rows[i].stock;
+      intervals.push({
+        date: rows[i].date,
+        consumo: Math.max(0, prev - curr),
+        entrada: Math.max(0, curr - prev),
+        stock: curr,
+      });
+    }
+
+    // Últimos N intervalos para consumo medio
+    const usedIntervals = intervals.slice(-Math.max(1, windowN));
+    const totalConsumo = usedIntervals.reduce((s, iv) => s + iv.consumo, 0);
+    const avgDailyConsumption = usedIntervals.length > 0 ? totalConsumo / usedIntervals.length : 0;
+
+    const latestRow = rows[rows.length - 1];
+    const stockActual = latestRow.stock;
+    const latestDate = latestRow.date;
+
+    // Último PVP no nulo
+    let lastPvp = null;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (rows[i].pvp != null) { lastPvp = rows[i].pvp; break; }
+    }
+
+    const horizonDemand = avgDailyConsumption * horizonH;
+    const safetyDemand = avgDailyConsumption * safetyExtraDays;
+
+    const coverageRatio = horizonDemand > 0 ? stockActual / horizonDemand : Infinity;
+    const coveragePct = isFinite(coverageRatio) ? coverageRatio * 100 : Infinity;
+
+    let daysCoverage;
+    if (avgDailyConsumption > 0) {
+      daysCoverage = stockActual / avgDailyConsumption;
+    } else if (stockActual === 0) {
+      daysCoverage = 0;
+    } else {
+      daysCoverage = Infinity;
+    }
+
+    // Riesgo rotura
+    let stockoutRisk;
+    if (avgDailyConsumption > 0) {
+      const d = new Date(latestDate);
+      d.setDate(d.getDate() + Math.floor(daysCoverage));
+      stockoutRisk = d.toLocaleDateString("es-ES");
+    } else if (stockActual === 0) {
+      stockoutRisk = "Hoy";
+    } else {
+      stockoutRisk = "Sin rotura (sin consumo)";
+    }
+
+    // Stock muerto
+    const isDead = stockActual > 0 && (avgDailyConsumption <= 0.1 || daysCoverage > 180);
+
+    // Estado
+    let estado;
+    if (stockActual === 0 || coveragePct <= minPct) {
+      estado = "ROJO";
+    } else if (coveragePct <= buyPct) {
+      estado = "AMARILLO";
+    } else {
+      estado = "VERDE";
+    }
+    if (estado !== "ROJO" && isDead) estado = "MUERTO";
+
+    // Compra sugerida
+    const shouldBuy = estado === "ROJO" || estado === "AMARILLO";
+    let suggestedQty = 0;
+    let purchaseValue = 0;
+    if (shouldBuy) {
+      const raw = Math.max(0, horizonDemand + safetyDemand - stockActual);
+      const mult = Math.max(1, roundingMultiple);
+      suggestedQty = Math.ceil(raw / mult) * mult;
+      purchaseValue = suggestedQty * (lastPvp || 0);
+    }
+
+    // Motivo
+    let motivo = "";
+    if (estado === "ROJO") motivo = stockActual === 0 ? "Sin stock" : `Cobertura ${coveragePct.toFixed(0)}% ≤ MIN ${minPct}%`;
+    else if (estado === "AMARILLO") motivo = `Cobertura ${coveragePct.toFixed(0)}% ≤ BUY ${buyPct}%`;
+    else if (estado === "MUERTO") motivo = daysCoverage > 180 ? `Cobertura ${Math.round(daysCoverage)}d > 180d` : "Consumo ≤ 0.1 u/día";
+    else motivo = `Cobertura ${coveragePct.toFixed(0)}% > BUY ${buyPct}%`;
+
+    // Tendencia sparkline (últimos 15 stocks)
+    const sparkData = rows.slice(-15).map(r => r.stock);
+
+    // Tendencia texto
+    let tendencia = "→";
+    if (sparkData.length >= 3) {
+      const last3 = sparkData.slice(-3);
+      if (last3[2] < last3[0]) tendencia = "↓";
+      else if (last3[2] > last3[0]) tendencia = "↑";
+    }
+
+    results.push({
+      sku,
+      clase,
+      latestDate,
+      stockActual,
+      tendencia,
+      avgDailyConsumption,
+      horizonDemand,
+      coveragePct,
+      daysCoverage,
+      stockoutRisk,
+      minPct,
+      buyPct,
+      lastPvp,
+      suggestedQty,
+      purchaseValue,
+      estado,
+      motivo,
+      sparkData,
+      intervals,
+    });
+  });
+
+  // Ordenar
+  results.sort((a, b) => {
+    const so = STATUS_ORDER[a.estado] - STATUS_ORDER[b.estado];
+    if (so !== 0) return so;
+    const dc = (isFinite(a.daysCoverage) ? a.daysCoverage : 1e9) - (isFinite(b.daysCoverage) ? b.daysCoverage : 1e9);
+    if (dc !== 0) return dc;
+    return b.avgDailyConsumption - a.avgDailyConsumption;
+  });
+
+  return results;
+}
+
+function exportRecommendations(results) {
+  const rows = results.map(r => ({
+    SKU: r.sku,
+    Clase: r.clase,
+    UltimaFecha: r.latestDate.toLocaleDateString("es-ES"),
+    Stock: r.stockActual,
+    ConsumoDiario: +r.avgDailyConsumption.toFixed(4),
+    DemandaH: +r.horizonDemand.toFixed(2),
+    CoberturaPct: isFinite(r.coveragePct) ? +r.coveragePct.toFixed(1) : 9999,
+    DiasCobertura: isFinite(r.daysCoverage) ? +r.daysCoverage.toFixed(1) : 9999,
+    RiesgoRotura: r.stockoutRisk,
+    PVP: r.lastPvp ?? "",
+    CantidadSugerida: r.suggestedQty,
+    EuroCompra: +r.purchaseValue.toFixed(2),
+    Estado: r.estado,
+    Motivo: r.motivo,
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Recomendaciones");
+  XLSX.writeFile(wb, "recomendaciones_compra.xlsx");
+}
+
+// ─── SPARKLINE SVG ─────────────────────────────────────────────────────────
+function Sparkline({ data, color = "#6366f1" }) {
+  if (!data || data.length < 2) return <span className="text-xs text-gray-400">—</span>;
+  const W = 80, H = 28, pad = 2;
+  const mn = Math.min(...data), mx = Math.max(...data);
+  const range = mx - mn || 1;
+  const pts = data.map((v, i) => {
+    const x = pad + (i / (data.length - 1)) * (W - pad * 2);
+    const y = H - pad - ((v - mn) / range) * (H - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return (
+    <svg width={W} height={H} style={{ display: "block" }}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round" />
+      <circle cx={pts.split(" ").pop().split(",")[0]} cy={pts.split(" ").pop().split(",")[1]} r="2.5" fill={color} />
+    </svg>
+  );
+}
+
+// ─── BADGE ESTADO ──────────────────────────────────────────────────────────
+const BADGE = {
+  ROJO:     "bg-red-100 text-red-700 border border-red-300",
+  AMARILLO: "bg-yellow-100 text-yellow-700 border border-yellow-300",
+  VERDE:    "bg-green-100 text-green-700 border border-green-300",
+  MUERTO:   "bg-gray-200 text-gray-600 border border-gray-300",
+};
+const SPARK_COLOR = { ROJO: "#ef4444", AMARILLO: "#f59e0b", VERDE: "#22c55e", MUERTO: "#9ca3af" };
+
+function Badge({ estado }) {
+  return <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${BADGE[estado]}`}>{estado}</span>;
+}
+
+// ─── FORMATEO ──────────────────────────────────────────────────────────────
+const fmtNum = (v, d = 1) => isFinite(v) ? v.toLocaleString("es-ES", { maximumFractionDigits: d }) : "∞";
+const fmtEur = (v) => isFinite(v) ? v.toLocaleString("es-ES", { style: "currency", currency: "EUR" }) : "—";
+
+// ─── COMPONENTE PRINCIPAL ──────────────────────────────────────────────────
+export default function App() {
+  const [config, setConfig] = useState(DEFAULT_CONFIG);
+  const [results, setResults] = useState([]);
+  const [warnings, setWarnings] = useState([]);
+  const [error, setError] = useState(null);
+  const [classBySku, setClassBySku] = useState({});
+  const [rawData, setRawData] = useState(null);
+  const [search, setSearch] = useState("");
+  const [filterStatus, setFilterStatus] = useState("TODOS");
+  const [loading, setLoading] = useState(false);
+  const fileRef = useRef();
+
+  // Recompute si config o classBySku cambia
+  const recompute = useCallback((data, cfg, cls) => {
+    try {
+      const res = calculateSkuRecommendations(data, cfg, cls);
+      setResults(res);
+    } catch (e) { setError(e.message); }
+  }, []);
+
+  const handleFile = useCallback(async (file) => {
+    setError(null); setWarnings([]); setResults([]);
+    setLoading(true);
+    try {
+      const buf = await file.arrayBuffer();
+      const { data, warnings: w } = parseWorkbook(new Uint8Array(buf));
+      setWarnings(w);
+      setRawData(data);
+      const cls = {};
+      recompute(data, config, cls);
+      setClassBySku(cls);
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  }, [config, recompute]);
+
+  const onDrop = useCallback((e) => {
+    e.preventDefault();
+    const f = e.dataTransfer.files[0];
+    if (f) handleFile(f);
+  }, [handleFile]);
+
+  const onFileChange = (e) => { if (e.target.files[0]) handleFile(e.target.files[0]); };
+
+  const updateConfig = (path, value) => {
+    setConfig(prev => {
+      const next = JSON.parse(JSON.stringify(prev));
+      const parts = path.split(".");
+      let obj = next;
+      for (let i = 0; i < parts.length - 1; i++) obj = obj[parts[i]];
+      obj[parts[parts.length - 1]] = value;
+      if (rawData) recompute(rawData, next, classBySku);
+      return next;
+    });
+  };
+
+  const updateClass = (sku, cls) => {
+    const next = { ...classBySku, [sku]: cls };
+    setClassBySku(next);
+    if (rawData) recompute(rawData, config, next);
+  };
+
+  // Filtrado
+  const filtered = useMemo(() => results.filter(r => {
+    const matchSearch = r.sku.toLowerCase().includes(search.toLowerCase());
+    const matchStatus = filterStatus === "TODOS" || r.estado === filterStatus;
+    return matchSearch && matchStatus;
+  }), [results, search, filterStatus]);
+
+  // Tarjetas
+  const summary = useMemo(() => {
+    const rojos = results.filter(r => r.estado === "ROJO").length;
+    const amarillos = results.filter(r => r.estado === "AMARILLO").length;
+    const verdes = results.filter(r => r.estado === "VERDE").length;
+    const muertos = results.filter(r => r.estado === "MUERTO").length;
+    const unidades = results.reduce((s, r) => s + r.suggestedQty, 0);
+    const inversion = results.reduce((s, r) => s + r.purchaseValue, 0);
+    const rotura7 = results.filter(r => r.avgDailyConsumption > 0 && isFinite(r.daysCoverage) && r.daysCoverage <= 7).length;
+    return { total: results.length, rojos, amarillos, verdes, muertos, unidades, inversion, rotura7 };
+  }, [results]);
+
+  // Warnings BUY <= MIN
+  const cfgWarnings = useMemo(() => {
+    const w = [];
+    ["A","B","C"].forEach(c => {
+      const { min, buy } = config.thresholds[c];
+      if (buy <= min) w.push(`Clase ${c}: BUY% (${buy}) ≤ MIN% (${min})`);
+    });
+    return w;
+  }, [config.thresholds]);
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-800 font-sans">
+      {/* Header */}
+      <header className="bg-indigo-700 text-white py-4 px-6 shadow-md flex items-center gap-3">
+        <span className="text-2xl">🛒</span>
+        <div>
+          <h1 className="text-xl font-bold tracking-tight">demo-purchase</h1>
+          <p className="text-indigo-200 text-xs">Recomendación de compras por SKU · 100% client-side</p>
+        </div>
+      </header>
+
+      <main className="max-w-screen-xl mx-auto px-4 py-6 space-y-6">
+
+        {/* Fila superior: Carga + Config */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+
+          {/* Carga de archivo */}
+          <div
+            className="lg:col-span-1 bg-white rounded-xl border-2 border-dashed border-indigo-300 p-6 flex flex-col items-center justify-center gap-3 cursor-pointer hover:border-indigo-500 transition"
+            onDrop={onDrop}
+            onDragOver={e => e.preventDefault()}
+            onClick={() => fileRef.current.click()}
+          >
+            <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={onFileChange} />
+            <span className="text-4xl">{loading ? "⏳" : "📂"}</span>
+            <p className="font-semibold text-indigo-700">Cargar Excel / CSV</p>
+            <p className="text-xs text-gray-400 text-center">Arrastra o haz clic · .xlsx .xls .csv</p>
+            <p className="text-xs text-gray-400 text-center">Columnas requeridas: <span className="font-mono">SKU, Date, Stock, PVP</span></p>
+            <p className="text-xs text-gray-400 text-center">Opcional: <span className="font-mono">Categoria</span> (A/B/C)</p>
+          </div>
+
+          {/* Panel de configuración */}
+          <div className="lg:col-span-2 bg-white rounded-xl border border-gray-200 p-5 shadow-sm">
+            <h2 className="font-bold text-sm text-gray-600 uppercase tracking-wide mb-4">⚙️ Configuración</h2>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+              {[
+                ["Ventana (N días)", "windowN"],
+                ["Horizonte (H días)", "horizonH"],
+                ["Días seguridad", "safetyExtraDays"],
+                ["Múltiplo redondeo", "roundingMultiple"],
+              ].map(([label, key]) => (
+                <label key={key} className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">{label}</span>
+                  <input
+                    type="number" min="1"
+                    value={config[key]}
+                    onChange={e => updateConfig(key, Math.max(1, parseInt(e.target.value) || 1))}
+                    className="border border-gray-200 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                  />
+                </label>
+              ))}
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              {["A","B","C"].map(c => (
+                <div key={c} className="bg-gray-50 rounded-lg p-3 space-y-2">
+                  <p className="text-xs font-bold text-indigo-600">Clase {c}</p>
+                  <label className="flex flex-col gap-0.5">
+                    <span className="text-xs text-gray-500">MIN %</span>
+                    <input type="number" min="0" max="100"
+                      value={config.thresholds[c].min}
+                      onChange={e => updateConfig(`thresholds.${c}.min`, Math.max(0, parseInt(e.target.value)||0))}
+                      className="border border-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                    />
+                  </label>
+                  <label className="flex flex-col gap-0.5">
+                    <span className="text-xs text-gray-500">BUY %</span>
+                    <input type="number" min="0" max="200"
+                      value={config.thresholds[c].buy}
+                      onChange={e => updateConfig(`thresholds.${c}.buy`, Math.max(0, parseInt(e.target.value)||0))}
+                      className="border border-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                    />
+                  </label>
+                </div>
+              ))}
+            </div>
+            {cfgWarnings.length > 0 && (
+              <div className="mt-3 space-y-1">
+                {cfgWarnings.map((w,i) => <p key={i} className="text-xs text-orange-600 bg-orange-50 rounded px-2 py-1">⚠️ {w}</p>)}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Error y warnings */}
+        {error && (
+          <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-red-700 text-sm font-medium">❌ {error}</div>
+        )}
+        {warnings.length > 0 && (
+          <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-4 space-y-1">
+            {warnings.slice(0, 4).map((w,i) => <p key={i} className="text-xs text-yellow-700">⚠️ {w}</p>)}
+            {warnings.length > 4 && <p className="text-xs text-yellow-500">…y {warnings.length - 4} avisos más</p>}
+          </div>
+        )}
+
+        {/* Tarjetas resumen */}
+        {results.length > 0 && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+            {[
+              { label: "SKUs", value: summary.total, color: "text-indigo-700", bg: "bg-indigo-50" },
+              { label: "🔴 Rojos", value: summary.rojos, color: "text-red-700", bg: "bg-red-50" },
+              { label: "🟡 Amarillos", value: summary.amarillos, color: "text-yellow-700", bg: "bg-yellow-50" },
+              { label: "🟢 Verdes", value: summary.verdes, color: "text-green-700", bg: "bg-green-50" },
+              { label: "⚫ Muertos", value: summary.muertos, color: "text-gray-600", bg: "bg-gray-100" },
+              { label: "Uds. sugeridas", value: fmtNum(summary.unidades, 0), color: "text-indigo-700", bg: "bg-indigo-50" },
+              { label: "Inversión", value: fmtEur(summary.inversion), color: "text-emerald-700", bg: "bg-emerald-50", small: true },
+              { label: "Rotura ≤7d", value: summary.rotura7, color: "text-red-700", bg: "bg-red-50" },
+            ].map(card => (
+              <div key={card.label} className={`${card.bg} rounded-xl p-3 flex flex-col gap-1`}>
+                <p className="text-xs text-gray-500">{card.label}</p>
+                <p className={`font-bold ${card.small ? "text-sm" : "text-xl"} ${card.color}`}>{card.value}</p>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Tabla de resultados */}
+        {results.length > 0 && (
+          <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
+            {/* Barra de herramientas */}
+            <div className="flex flex-wrap gap-3 items-center px-4 py-3 border-b border-gray-100">
+              <input
+                type="text" placeholder="🔍 Buscar SKU…"
+                value={search} onChange={e => setSearch(e.target.value)}
+                className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 w-48"
+              />
+              <div className="flex gap-1">
+                {["TODOS","ROJO","AMARILLO","MUERTO","VERDE"].map(s => (
+                  <button key={s}
+                    onClick={() => setFilterStatus(s)}
+                    className={`px-3 py-1 rounded-full text-xs font-semibold transition
+                      ${filterStatus === s
+                        ? "bg-indigo-600 text-white"
+                        : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
+                  >{s}</button>
+                ))}
+              </div>
+              <button
+                onClick={() => exportRecommendations(results)}
+                className="ml-auto bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold px-4 py-1.5 rounded-lg transition"
+              >⬇️ Exportar XLSX</button>
+            </div>
+
+            {/* Tabla */}
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50 text-gray-500 uppercase tracking-wide">
+                  <tr>
+                    {["SKU","Clase","Última fecha","Stock","Tendencia","Cons./día","Demanda H","Cob. %","Días cob.","Rotura","MIN%","BUY%","PVP","Qty","€ Compra","Estado","Motivo"].map(h => (
+                      <th key={h} className="px-3 py-2 text-left font-semibold whitespace-nowrap">{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.length === 0 && (
+                    <tr><td colSpan={17} className="px-4 py-8 text-center text-gray-400">Sin resultados</td></tr>
+                  )}
+                  {filtered.map(r => (
+                    <tr key={r.sku} className="border-t border-gray-50 hover:bg-gray-50 transition">
+                      <td className="px-3 py-2 font-mono font-semibold text-indigo-700 whitespace-nowrap">{r.sku}</td>
+                      <td className="px-3 py-2">
+                        <select value={r.clase} onChange={e => updateClass(r.sku, e.target.value)}
+                          className="border border-gray-200 rounded px-1 py-0.5 text-xs bg-white focus:outline-none focus:ring-1 focus:ring-indigo-400">
+                          <option>A</option><option>B</option><option>C</option>
+                        </select>
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap">{r.latestDate.toLocaleDateString("es-ES")}</td>
+                      <td className="px-3 py-2 tabular-nums">{fmtNum(r.stockActual, 0)}</td>
+                      <td className="px-3 py-2">
+                        <Sparkline data={r.sparkData} color={SPARK_COLOR[r.estado]} />
+                      </td>
+                      <td className="px-3 py-2 tabular-nums">{fmtNum(r.avgDailyConsumption, 2)}</td>
+                      <td className="px-3 py-2 tabular-nums">{fmtNum(r.horizonDemand, 1)}</td>
+                      <td className="px-3 py-2 tabular-nums">{isFinite(r.coveragePct) ? fmtNum(r.coveragePct, 1)+"%" : "∞"}</td>
+                      <td className="px-3 py-2 tabular-nums">{isFinite(r.daysCoverage) ? fmtNum(r.daysCoverage, 1) : "∞"}</td>
+                      <td className="px-3 py-2 whitespace-nowrap">{r.stockoutRisk}</td>
+                      <td className="px-3 py-2 tabular-nums">{r.minPct}%</td>
+                      <td className="px-3 py-2 tabular-nums">{r.buyPct}%</td>
+                      <td className="px-3 py-2 tabular-nums">{r.lastPvp != null ? fmtEur(r.lastPvp) : "—"}</td>
+                      <td className="px-3 py-2 tabular-nums font-semibold">{r.suggestedQty > 0 ? fmtNum(r.suggestedQty, 0) : "—"}</td>
+                      <td className="px-3 py-2 tabular-nums">{r.purchaseValue > 0 ? fmtEur(r.purchaseValue) : "—"}</td>
+                      <td className="px-3 py-2"><Badge estado={r.estado} /></td>
+                      <td className="px-3 py-2 text-gray-500 max-w-xs truncate">{r.motivo}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="text-xs text-gray-400 px-4 py-2 border-t border-gray-100">{filtered.length} de {results.length} SKUs mostrados</p>
+          </div>
+        )}
+
+        {!results.length && !error && (
+          <div className="text-center py-16 text-gray-300">
+            <p className="text-6xl mb-4">📊</p>
+            <p className="text-lg font-medium">Carga un archivo para comenzar</p>
+            <p className="text-sm mt-1">Los resultados aparecerán aquí automáticamente</p>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
